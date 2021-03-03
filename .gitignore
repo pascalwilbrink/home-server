@@ -1,7 +1,7 @@
-**/
+*
 
 !network-stack.yml
 !README.md
-!_stacks/**
+!_stacks/*
 
-!**/.gitkeep
+!*/.gitkeep

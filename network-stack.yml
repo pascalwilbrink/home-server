@@ -1,0 +1,289 @@
+version: '3.5'
+
+networks:
+  openldap:
+    driver: overlay
+  portainer:
+    driver: overlay
+  traefik:
+    driver: overlay
+    external: true
+  elk:
+    driver: overlay
+
+volumes:
+  guacamole_config:
+
+services:
+
+  ### TRAEFIK ###
+  traefik:
+    image: traefik:latest
+    command:
+      - '--api.insecure=true'
+      - '--api.dashboard=true'
+      - '--api.debug=true'
+      - '--log.level=DEBUG'
+      - '--providers.docker=true'
+      - '--entryPoints.web.address=:80'
+      - '--entrypoints.web-secured.address=:443'
+      - '--providers.docker.watch=true'
+      - '--providers.docker.swarmMode=true'
+      - '--providers.docker.exposedbydefault=false'
+      - '--providers.docker.network=traefik'
+      - '--certificatesresolvers.mytlschallenge.acme.httpChallenge.entrypoint=web'
+      - '--certificatesresolvers.mytlschallenge.acme.email=pascal.wilbrink@gmail.com'
+      - '--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json'
+      - '--accessLog.bufferingSize=0'
+    volumes:
+      - '/var/run/docker.sock:/var/run/docker.sock:ro'
+      - './traefik/letsencrypt:/letsencrypt'
+    ports:
+      - '80:80'
+      - '8088:8080'
+      - '443:443'
+    networks:
+      - traefik
+    deploy:
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.api.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/traefik`)'
+        - 'traefik.http.routers.api.service=api@internal'
+
+
+  ### LDAP ###
+  openldap:
+    image: osixia/openldap:latest
+    ports:
+      - 389:389
+      - 636:636
+    environment:
+      - LDAP_ORGANISATION=Wilbrink
+      - LDAP_DOMAIN=wilbrink.nl
+      - LDAP_BASE_DN=dc=wilbrink,dc=nl
+      - LDAP_ADMIN_PASSWORD=password
+      - LDAP_TLS=false
+      - LDAP_TLS_ENFORCE=false
+      - LDAP_TLS_VERIFY_CLIENT=never
+    volumes:
+      - ./ldap/ldif:/container/ldif
+      - ./ldap/data/slapd/database:/var/lib/ldap
+      - ./ldap/data/slapd/config:/etc/ldap/slapd.d
+    networks:
+      - openldap
+      - elk
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+  ### PHP LDAP ADMIN ###
+  phpldapadmin:
+    image: osixia/phpldapadmin:latest
+    ports:
+      - 8090:80
+    environment:
+      - PHPLDAPADMIN_LDAP_HOSTS=openldap
+      - PHPLDAPADMIN_HTTPS=false
+    networks:
+      - openldap
+      - traefik
+      - elk
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.phpldapadmin.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/phpldapadmin`)'
+        - 'traefik.http.routers.phpldapadmin.entrypoints=web'
+        - 'traefik.http.services.phpldapadmin.loadbalancer.server.port=80'
+        - 'traefik.http.routers.phpldapadmin-secured.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/phpldapadmin`)'
+        - 'traefik.http.routers.phpldapadmin-secured.entrypoints=web-secured'
+        - 'traefik.http.routers.phpldapadmin-secured.tls.certresolver=mytlschallenge'
+
+  ### HEIMDALL ###
+  heimdall:
+    image: ghcr.io/linuxserver/heimdall
+    ports:
+      - 8080:80
+      - 444:443
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+    volumes:
+      - ./heimdall/config:/config
+    networks:
+      - traefik
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.heimdall.rule=Host(`home.pascalwilbrink.local`)'
+        - 'traefik.http.routers.heimdall.entrypoints=web'
+        - 'traefik.http.services.heimdall.loadbalancer.server.port=80'
+        - 'traefik.http.routers.heimdall-secured.rule=Host(`home.pascalwilbrink.local`)'
+        - 'traefik.http.routers.heimdall-secured.entrypoints=web-secured'
+        - 'traefik.http.routers.heimdall-secured.tls.certresolver=mytlschallenge'
+
+  ### PORTAINER AGENT ###
+  portainer_agent:
+    image: portainer/agent
+    environment:
+      AGENT_CLUSTER_ADDR: tasks.portainer_agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - portainer
+    deploy:
+      mode: global
+
+  ### PORTAINER ###
+  portainer:
+    image: portainer/portainer:latest
+    command: -H tcp://tasks.portainer_agent:9001 --tlsskipverify
+    ports:
+      - "9002:9000"
+      - "8000:8000"
+    volumes:
+      - ./portainer/data:/data
+    networks:
+      - portainer
+      - traefik
+      - openldap
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.portainer.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/portainer`)'
+        - 'traefik.http.routers.portainer.entrypoints=web'
+        - 'traefik.http.routers.portainer.middlewares=portainer-stripprefix'
+        - 'traefik.http.services.portainer.loadbalancer.server.port=9000'
+        - 'traefik.http.routers.portainer-secured.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/portainer`)'
+        - 'traefik.http.routers.portainer-secured.entrypoints=web-secured'
+        - 'traefik.http.routers.portainer-secured.tls.certresolver=mytlschallenge'
+        - 'traefik.http.routers.portainer-secured.middlewares=portainer-stripprefix'
+        - 'traefik.http.middlewares.portainer-stripprefix.stripprefix.prefixes=/portainer'
+
+  ### GUACAMOLE ###
+  guacamole:
+    image: oznu/guacamole
+    ports:
+      - 8070:8080
+    environment:
+      - EXTENSIONS=auth-ldap
+      - LDAP_HOSTNAME=ldap://openldap
+      - LDAP_ENCRYPTION_METHOD=none
+      - LDAP_PORT=389
+      - LDAP_USER_BASE_DN=ou=people,dc=wilbrink,dc=nl
+      - LDAP_SEARCH_BIND_DN=cn=admin,dc=wilbrink,dc=nl
+      - LDAP_SEARCH_BIND_PASSWORD=password
+      - LDAP_USERNAME_ATTRIBUTE=uid
+      - GUACD_LOG_LEVEL=debug
+    networks:
+      - traefik
+      - openldap
+    volumes:
+      - guacamole_config:/config
+    deploy:
+      mode: replicated
+      replicas: 1
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.guacamole.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/guacamole`)'
+        - 'traefik.http.routers.guacamole.entrypoints=web'
+        - 'traefik.http.routers.guacamole.middlewares=guacamole-stripprefix'
+        - 'traefik.http.services.guacamole.loadbalancer.server.port=8080'
+        - 'traefik.http.routers.guacamole-secured.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/guacamole`)'
+        - 'traefik.http.routers.guacamole-secured.entrypoints=web-secured'
+        - 'traefik.http.routers.guacamole-secured.tls.certresolver=mytlschallenge'
+        - 'traefik.http.routers.guacamole-secured.middlewares=guacamole-stripprefix'
+        - 'traefik.http.middlewares.guacamole-stripprefix.stripprefix.prefixes=/guacamole'
+
+  ### ELASTICSEARCH ###
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.6.2
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xmx256m -Xms256m
+      - ELASTIC_PASSWORD=pass
+    ports:
+      - 9200:9200
+      - 9300:9300
+    networks:
+      - elk
+    volumes:
+      - ./elasticsearch/data:/usr/share/elasticsearch/data
+    deploy:
+      mode: replicated
+      replicas: 1
+    
+  ### LOGSTASH
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.6.2
+    volumes:
+      - ./logstash:/etc/logstash
+    command: logstash -f /etc/logstash/logstash.conf
+    ports:
+      - 5044:5044
+      - 5000:5000/tcp
+      - 5000:5000/udp
+      - 9600:9600
+      - 12201:12201/udp
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  ### KIBANA
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.6.2
+    ports:
+      - 5601:5601
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch
+      - logstash
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  ### JENKINS ###
+  jenkins:
+    image: jenkins/jenkins:lts
+    ports:
+      - 8888:8080
+      - 50000:50000
+    volumes:
+      - ./jenkins/home:/var/jenkins_home
+    networks:
+      - openldap
+      - traefik
+    deploy:
+      mode: replicated
+      replicas: 1
+      labels:
+        - 'traefik.enable=true'
+        - 'traefik.http.routers.jenkins.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/jenkins`)'
+        - 'traefik.http.routers.jenkins.entrypoints=web'
+        - 'traefik.http.routers.jenkins.middlewares=jenkins-stripprefix'
+        - 'traefik.http.services.jenkins.loadbalancer.server.port=8080'
+        - 'traefik.http.routers.jenkins-secured.rule=Host(`app.pascalwilbrink.local`) && PathPrefix(`/jenkins`)'
+        - 'traefik.http.routers.jenkins-secured.entrypoints=web-secured'
+        - 'traefik.http.routers.jenkins-secured.tls.certresolver=mytlschallenge'
+        - 'traefik.http.routers.jenkins-secured.middlewares=jenkins-stripprefix'
+        - 'traefik.http.middlewares.jenkins-stripprefix.stripprefix.prefixes=/jenkins'

@@ -1,7 +1,19 @@
-*
+elasticsearch/*
+guacamole/*
+heimdall/*
+jenkins/*
+ldap/*
+logstash/*
+mongo/*
+portainer/*
+traefik/*
 
-!network-stack.yml
-!README.md
-!_stacks/*
-
-!*/.gitkeep
+!elasticsearch/.gitkeep
+!guacamole/.gitkeep
+!heimdall/.gitkeep
+!jenkins/.gitkeep
+!ldap/.gitkeep
+!logstash/.gitkeep
+!mongo/.gitkeep
+!portainer/.gitkeep
+!traefik/.gitkeep
